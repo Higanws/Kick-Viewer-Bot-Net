@@ -363,6 +363,307 @@ Kick.com API/Streams
 
 ---
 
+## 🔬 Detalles Técnicos de Implementación
+
+Esta sección documenta los aspectos técnicos internos del sistema basados en el análisis del código fuente.
+
+### Sistema de Gestión de Cuentas (AccountManager)
+
+**Ubicación**: `server/utils/accountManager.ts`
+
+**Características**:
+- **Cooldown por cuenta**: 5 minutos (300,000 ms) después de cada uso
+- **Tracking en memoria**: Usa `Map<string, number>` para rastrear última vez usado
+- **Persistencia**: Auto-guardado en `data/accounts.json`
+- **Estados**: Solo cuentas con `isActive: true` son elegibles
+
+**Métodos principales**:
+```typescript
+getAvailableAccount(): KickAccount | null  // Obtiene cuenta disponible (no en cooldown)
+releaseAccount(username: string): void     // Libera cooldown inmediatamente
+loadAccounts(): void                       // Recarga desde accounts.json
+getActiveAccountCount(): number            // Retorna cantidad de cuentas activas
+addAccount(account: KickAccount): void     // Añade nueva cuenta
+updateAccount(username: string, updates: Partial<KickAccount>): boolean
+removeAccount(username: string): boolean
+```
+
+**Flujo de cooldown**:
+1. Cuenta se asigna → `cooldowns.set(username, Date.now())`
+2. Durante 5 minutos → Cuenta no disponible
+3. Después de 5 minutos → Automáticamente disponible
+4. O liberar manualmente → `releaseAccount(username)`
+
+### Worker Threads - KickViewer
+
+**Ubicación**: `server/workers/kickViewer.js`
+
+**Configuración de timing**:
+- **Heartbeats**: Cada 30 segundos (30,000 ms)
+- **Timeout de sesión**: Según duración configurada (10-300 segundos)
+- **Timeout de conexión**: 10,000 ms
+
+**APIs de Kick utilizadas**:
+```
+GET https://kick.com/api/v2/channels/{channelName}
+  → Verifica existencia del canal y estado LIVE/OFFLINE
+  
+GET https://kick.com/{channelName}
+  → Simula vista de página (genera viewer count)
+```
+
+**Parsing de URLs flexible**:
+- Acepta: `https://kick.com/xqc`
+- Acepta: `https://kick.com/xqc/livestream/123456`
+- Acepta: `xqc` (nombre directo)
+- Extrae automáticamente el nombre del canal de cualquier formato
+
+**Flujo de ejecución por worker**:
+1. **Parse URL** → Extrae nombre de canal
+2. **Crear cliente HTTP** → Con proxy + user-agent + cookies (si autenticado)
+3. **GET API v2** → Verificar canal existe
+4. **Verificar estado** → LIVE o OFFLINE (ambos cuentan como viewer)
+5. **GET página principal** → Simular visita real
+6. **Iniciar heartbeats** → Cada 30s, envía GET a API para mantener sesión
+7. **Esperar duración** → Timeout según configuración
+8. **Cleanup** → Detener heartbeats, liberar cuenta, exit
+
+**Mensajes de log**:
+- 🔗 Connecting to... → Inicio de conexión
+- ✅ Connected to {channel} - LIVE/OFFLINE → Conexión exitosa
+- 💓 Heartbeat #{n} → Heartbeat exitoso
+- ⚠️ Heartbeat failed → Heartbeat falló
+- ⏹️ Viewer session ended → Sesión completada
+- ❌ Failed to connect → Error de conexión
+
+### Cliente HTTP (clientUtils.js)
+
+**Ubicación**: `server/utils/clientUtils.js`
+
+**Configuraciones de timeout**:
+```javascript
+// Cliente genérico
+timeout: 5000 ms
+maxRedirects: 3
+
+// Cliente Kick (createKickClient)
+timeout: 10000 ms
+maxRedirects: 5
+validateStatus: status < 500
+```
+
+**Headers personalizados para Kick**:
+```javascript
+User-Agent: {userAgent}
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8
+Accept-Language: en-US,en;q=0.5
+Accept-Encoding: gzip, deflate, br
+Connection: keep-alive
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Cookie: token={account.token}  // Solo si autenticado
+```
+
+**Soporte de proxies**:
+- **HTTP/HTTPS**: Usa configuración nativa de axios
+- **SOCKS4/SOCKS5**: Usa `SocksProxyAgent` como httpAgent/httpsAgent
+- **Autenticación**: Soporta username:password en formato URI
+
+### Sistema de Proxies (proxyUtils.ts)
+
+**Ubicación**: `server/proxyUtils.ts`
+
+**Detección automática de protocolo por puerto**:
+```typescript
+80   → http
+443  → https
+1080 → socks5
+1081 → socks4
+8080 → http
+8443 → https
+Otro → http (default)
+```
+
+**Normalización automática**:
+- Si falta protocolo → Inferir por puerto
+- Si falta puerto → Default 8080
+- Filtrado → Solo protocolos soportados (http, https, socks4, socks5)
+
+**Formatos de proxy soportados**:
+```
+protocol://host:port
+protocol://username:password@host:port
+host:port (auto-detecta protocolo por puerto)
+```
+
+### Interfaces TypeScript (lib.ts)
+
+**Ubicación**: `server/lib.ts`
+
+```typescript
+// Proxy
+interface Proxy {
+  protocol: "http" | "https" | "socks4" | "socks5" | string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+}
+
+// Cuenta de Kick
+interface KickAccount {
+  username: string;
+  email: string;
+  token?: string;        // Token de sesión de Kick
+  password?: string;     // Alternativo (no implementado actualmente)
+  lastUsed?: number;     // Timestamp de último uso
+  isActive: boolean;     // Solo cuentas activas son usadas
+}
+
+// Configuración de test
+interface ViewerTestConfig {
+  channelUrl: string;
+  anonymousViewers: number;
+  authenticatedViewers: number;
+  duration: number;
+  accounts?: KickAccount[];
+}
+
+// Modos de viewer
+type ViewerMode = "anonymous" | "authenticated";
+```
+
+### Límites Configurables en Frontend
+
+**Ubicación**: `src/App.tsx`
+
+**Anonymous Viewers** (líneas 283-289):
+```typescript
+Math.min(50, Math.max(0, Number(e.target.value)))
+min="0"
+max="50"
+```
+
+**Authenticated Viewers** (líneas 301-310):
+```typescript
+Math.min(20, Math.max(0, Number(e.target.value)))
+min="0"
+max="20"
+disabled={!hasAccounts}  // Se desactiva si no hay cuentas
+```
+
+**Test Duration** (líneas 321-328):
+```typescript
+Math.min(300, Math.max(10, Number(e.target.value)))
+min="10"
+max="300"  // 5 minutos máximo
+```
+
+**Para modificar estos límites**:
+1. Editar `src/App.tsx`
+2. Cambiar `Math.min(VALOR_MAXIMO, ...)` a tu límite deseado
+3. Cambiar atributo `max="VALOR"` del input
+4. Actualizar texto informativo `<p>Max: VALOR</p>`
+5. Rebuild: `npm run build`
+
+### Comunicación Socket.IO
+
+**Ubicación**: `server/index.ts` y `src/App.tsx`
+
+**Eventos del cliente → servidor**:
+- `startViewerTest` → Payload: `{ channelUrl, anonymousViewers, authenticatedViewers, duration }`
+- `stopViewerTest` → Sin payload, detiene workers activos
+
+**Eventos del servidor → cliente**:
+- `viewerStats` → Payload: `{ activeViewers?, totalConnections?, totalViewTime?, availableAccounts?, log? }`
+- `testEnd` → Sin payload, indica fin de test
+
+**Estadísticas tracked**:
+```typescript
+{
+  activeViewers: number;      // Viewers actualmente conectados
+  totalConnections: number;   // Conexiones totales realizadas
+  totalViewTime: number;      // Tiempo total de vista (segundos)
+  availableAccounts: number;  // Cuentas disponibles (no en cooldown)
+}
+```
+
+**Logs en tiempo real**:
+- Cada evento importante genera un log con emoji identificador
+- Los logs se muestran en frontend con timestamp automático
+- Máximo 15 logs visibles (los más recientes)
+
+### Ciclo de Vida de un Viewer
+
+**1. Inicio del test** (cliente):
+```
+Usuario hace clic → startViewerTest emitido → Backend recibe evento
+```
+
+**2. Creación de workers** (backend):
+```
+Para cada viewer:
+  - Asignar proxy del pool (rotación circular)
+  - Asignar user-agent del pool (rotación circular)
+  - Si autenticado: Obtener cuenta disponible (sin cooldown)
+  - Crear Worker con workerData
+  - Registrar listeners (message, error, exit)
+```
+
+**3. Ejecución del worker**:
+```
+Parse URL → Crear cliente HTTP → GET API verificar canal →
+GET página principal → Iniciar heartbeats cada 30s →
+Esperar duración → Cleanup → Exit
+```
+
+**4. Durante ejecución**:
+```
+Worker envía mensajes → parentPort.postMessage() →
+Backend escucha → worker.on('message') →
+Backend reenvía → socket.emit('viewerStats') →
+Frontend actualiza → UI en tiempo real
+```
+
+**5. Finalización**:
+```
+Worker exit → Backend cuenta finished →
+Si todos finalizaron → Emitir 'testEnd' →
+Frontend actualiza → Botón vuelve a "Start"
+```
+
+**6. Cleanup de cuenta autenticada**:
+```
+Worker exit → worker.on('exit') →
+accountManager.releaseAccount(username) →
+Cuenta disponible inmediatamente (cooldown removido)
+```
+
+### Consideraciones de Rendimiento
+
+**Límites prácticos identificados**:
+- **Proxies**: Necesitas N proxies para N viewers anónimos
+- **Workers**: Un Worker Thread por viewer (puede saturar CPU en +50)
+- **Memoria**: ~10-50 MB por worker activo
+- **Red**: Heartbeats cada 30s = 2 requests/min/viewer
+
+**Cuellos de botella comunes**:
+1. **Falta de proxies válidos** → Reduce viewers o añade más proxies
+2. **Proxies lentos** → Timeouts frecuentes, considerar proxies premium
+3. **Muchos workers** → Saturación de CPU, reduce concurrencia
+4. **Rate limiting de Kick** → Reduce frecuencia o usa más IPs distintas
+
+**Optimizaciones implementadas**:
+- Worker threads para paralelismo real (no solo async)
+- Rotación de proxies para distribuir carga
+- Heartbeats espaciados (30s) para minimizar requests
+- Cooldown de cuentas para evitar spam
+- Timeouts agresivos para detectar proxies muertos rápido
+
+---
+
 ## 📊 Métricas de Rendimiento
 
 ### Indicadores de Éxito
