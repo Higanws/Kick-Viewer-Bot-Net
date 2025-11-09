@@ -70,7 +70,7 @@ body {
   }
 }
 
-/* styling is done for the volume bar to match the rest of the miku theme. code was generated from: https://danielstern.ca/range.css/?ref=css-tricks#/ and background was replaced with linear-gradient */
+/* styling is done for the volume bar to match the rest of the kick theme. code was generated from: https://danielstern.ca/range.css/?ref=css-tricks#/ and background was replaced with linear-gradient */
 input[type=range].volume_bar {
   width: 100%;
   margin: 5px 0;
